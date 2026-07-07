@@ -110,6 +110,11 @@ def health():
 def _cutout_rgba(src_path: str) -> Image.Image:
     im = Image.open(src_path).convert("RGBA")
     out = remove(im, session=_cut_session, post_process_mask=True)
+    # Crop to the product's alpha bounding box (drop transparent padding) so the product is tight
+    # and centers/sizes correctly wherever it's placed (hero slot object-fit, /animate framing).
+    bbox = out.getbbox()
+    if bbox:
+        out = out.crop(bbox)
     # Upscale so the isolated product is crisp at display size (source photos are often small).
     w, h = out.size
     lo = max(w, h)
@@ -165,19 +170,16 @@ def _animate_bytes(src_path: str, motion: str, dur: float, out_w: int, out_h: in
             p = 2 * math.pi * i / n  # 0..2π => seamless loop
             canvas = Image.new("RGBA", (out_w, out_h), (0, 0, 0, 0))
             if motion == "spin":
-                # fake-3D horizontal turn: squash width by cos(p); mirror on the back half.
-                cw = max(1, abs(math.cos(p)))
-                fr = base.transpose(Image.FLIP_LEFT_RIGHT) if math.cos(p) < 0 else base
-                fw = max(2, round(base.width * cw))
-                fr = fr.resize((fw, base.height), Image.LANCZOS)
-                dy = 0.0
-                ang = 0.0
+                # gentle "turn" illusion: subtle horizontal scale + small tilt + bob. No hard edge-on.
+                sx = 0.96 + 0.04 * math.cos(p)
+                fr = base.resize((max(2, round(base.width * sx)), base.height), Image.LANCZOS)
+                fr = fr.rotate(2.0 * math.sin(p), resample=Image.BICUBIC, expand=True)
+                dy = 0.02 * out_h * math.sin(p)
             else:  # "float": gentle levitation + sway
                 fr = base.rotate(3.0 * math.sin(p), resample=Image.BICUBIC, expand=True)
                 dy = 0.035 * out_h * math.sin(p)
-                ang = 0.0  # already applied
             x = (out_w - fr.width) // 2
-            y = int((out_h - fr.height) // 2 + (dy if motion != "spin" else 0.028 * out_h * math.sin(p)))
+            y = int((out_h - fr.height) // 2 + dy)
             canvas.alpha_composite(fr, (x, y))
             canvas.save(os.path.join(cdir, f"{i + 1:04d}.png"))
         out = os.path.join(work, "out.webm")
