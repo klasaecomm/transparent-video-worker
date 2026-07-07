@@ -1,45 +1,49 @@
 """
-Transparent product-video worker (Higgsfield platform REST edition).
+Product-asset worker — clean transparent product cutouts and synthesized motion.
 
 Endpoints:
 
-1) GET  /health                                   -> 200 {ok}
+1) GET  /health                                    -> 200 {ok}
 
-2) POST /render   { "video_url": "<https mp4>" }   -> 200 video/webm (alpha)
-   Turns an OPAQUE product mp4 into a browser-transparent WebM-VP9-alpha by removing the
-   background per frame (true alpha) and re-encoding with an alpha channel. Synchronous.
+2) POST /cutout  { image_url }                      -> 200 image/png (alpha)
+   Real product photo -> clean transparent PNG (rembg u2net) + Lanczos upscale. This is the
+   canonical product image (OBRAZ A): used directly for isolated-product image slots and as the
+   source for /animate. No generative model -> no hallucinated water, real product, real detail.
 
-3) POST /cutout   { "image_url": "<https img>" }   -> 200 image/png (alpha)
-   Removes the background of a still product photo with rembg -> transparent PNG. Used as the
-   canonical product image (OBRAZ A) for asset generation and as the video start frame.
+3) POST /animate { image_url, motion?, duration?, out_w?, out_h? }  -> 200 video/webm (alpha)
+   Synthesizes a premium seamless motion loop (gentle float + sway, or fake-3D spin) from the
+   transparent product PNG and encodes it to WebM-VP9-alpha. Motion is computed, not generated,
+   so the product stays EXACTLY the real product — no water, no artefacts, clean transparency.
 
-4) POST /produce  { hf_auth, hf_base?, job_set_id, upload, callback }  -> 202
-   Store-builder video stage, run OFF the Lovable edge function (short wall-clock budget) and
-   OFF Higgsfield's slow DoP generation (~5-8 min). The edge function submits the Higgsfield
-   image2video job (fast) and hands the job_set_id here; this worker — no time limit — polls
-   Higgsfield's platform REST until the mp4 is ready, makes it transparent (same per-frame
-   pipeline as /render), uploads the WebM to a Supabase signed upload URL, then calls back the
-   edge function to finalize the asset.
+4) POST /render  { video_url }                      -> 200 video/webm (alpha)
+   Opaque mp4 -> transparent WebM (per-frame rembg). Kept for ad-hoc use.
 
-Why per-frame: generative video returns opaque mp4/H.264. Real browser transparency needs WebM
-VP9 alpha (yuva420p). rembg on each frame yields a true alpha PNG; ffmpeg re-encodes to WebM-alpha.
+5) POST /produce { hf_auth, job_set_id, upload, callback }  -> 202
+   Higgsfield platform-REST poll -> transparency -> upload -> callback. Kept; unused by the
+   current store pipeline (generative product video hallucinated water on spray products).
+
+Real browser transparency needs WebM VP9 alpha (yuva420p); rembg yields the true alpha.
 """
-import os, glob, json, shutil, subprocess, tempfile, threading, time, urllib.request, urllib.error
+import math, os, glob, json, shutil, subprocess, tempfile, threading, time, urllib.request, urllib.error
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import Response
 from pydantic import BaseModel
 from rembg import remove, new_session
 from PIL import Image
 
-REMBG_MODEL = os.environ.get("REMBG_MODEL", "u2netp")  # u2netp = fast; u2net = max quality
-CRF = os.environ.get("VP9_CRF", "32")
-MAX_FRAMES = int(os.environ.get("MAX_FRAMES", "600"))              # safety cap (~25s @ 24fps)
-POLL_TIMEOUT = int(os.environ.get("PRODUCE_POLL_TIMEOUT", "1200"))  # Higgsfield DoP can take 5-8 min
+CUTOUT_MODEL = os.environ.get("CUTOUT_MODEL", "u2net")   # full model — cleaner than u2netp
+VIDEO_MODEL = os.environ.get("REMBG_MODEL", "u2netp")     # per-frame /render stays fast
+CRF = os.environ.get("VP9_CRF", "30")
+MAX_FRAMES = int(os.environ.get("MAX_FRAMES", "600"))
+UPSCALE_LONG = int(os.environ.get("CUTOUT_UPSCALE_LONG", "1600"))
+ANIM_LONG = int(os.environ.get("ANIM_LONG", "1000"))     # cap animation long side (speed)
+POLL_TIMEOUT = int(os.environ.get("PRODUCE_POLL_TIMEOUT", "1200"))
 HF_BASE_DEFAULT = os.environ.get("HF_BASE", "https://platform.higgsfield.ai")
 UA = "curl/8.4.0"
 
-app = FastAPI(title="transparent-video-worker")
-_session = new_session(REMBG_MODEL)  # load model once at startup
+app = FastAPI(title="product-asset-worker")
+_cut_session = new_session(CUTOUT_MODEL)
+_vid_session = new_session(VIDEO_MODEL)
 WORKER_TOKEN = os.environ.get("WORKER_TOKEN")
 
 
@@ -51,9 +55,17 @@ class CutoutIn(BaseModel):
     image_url: str
 
 
+class AnimateIn(BaseModel):
+    image_url: str
+    motion: str | None = None       # "float" (default) | "spin"
+    duration: float | None = None   # seconds (default 4)
+    out_w: int | None = None
+    out_h: int | None = None
+
+
 class UploadTarget(BaseModel):
-    url: str            # full Supabase signed upload URL (PUT), content-type video/webm
-    storage_path: str   # e.g. "<storeId>/pour-anim.webm" — echoed back in the callback
+    url: str
+    storage_path: str
 
 
 class Callback(BaseModel):
@@ -63,8 +75,8 @@ class Callback(BaseModel):
 
 
 class ProduceIn(BaseModel):
-    hf_auth: str                 # "KEY_ID:KEY_SECRET" — sent as `Authorization: Key ...`
-    job_set_id: str              # already-submitted Higgsfield image2video job set
+    hf_auth: str
+    job_set_id: str
     upload: UploadTarget
     callback: Callback
     hf_base: str | None = None
@@ -77,46 +89,144 @@ def _run(cmd: list[str]):
 
 
 def _download(url: str, dest: str):
-    """Download to a file with a browser-ish UA — Higgsfield's CDN blocks the default
-    python-urllib UA (Cloudflare error 1010), which urllib.urlretrieve would trip on."""
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*"})
     with urllib.request.urlopen(req, timeout=120) as r, open(dest, "wb") as f:
         shutil.copyfileobj(r, f)
 
 
+def _encode_webm_alpha(cdir: str, fps: str, out: str):
+    _run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", fps,
+          "-i", os.path.join(cdir, "%04d.png"),
+          "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-b:v", "0", "-crf", CRF, "-an", out])
+
+
 @app.get("/health")
 def health():
-    return {"ok": True, "model": REMBG_MODEL}
+    return {"ok": True, "cutout_model": CUTOUT_MODEL, "video_model": VIDEO_MODEL}
 
 
-# ---------- transparency core (shared by /render and /produce) ----------
+# ---------- cutout (real product -> clean transparent PNG, upscaled) ----------
+
+def _cutout_rgba(src_path: str) -> Image.Image:
+    im = Image.open(src_path).convert("RGBA")
+    out = remove(im, session=_cut_session, post_process_mask=True)
+    # Upscale so the isolated product is crisp at display size (source photos are often small).
+    w, h = out.size
+    lo = max(w, h)
+    if lo < UPSCALE_LONG:
+        scale = UPSCALE_LONG / lo
+        out = out.resize((round(w * scale), round(h * scale)), Image.LANCZOS)
+    return out
+
+
+@app.post("/cutout")
+def cutout(body: CutoutIn, authorization: str | None = Header(default=None)):
+    if WORKER_TOKEN and authorization != f"Bearer {WORKER_TOKEN}":
+        raise HTTPException(401, "unauthorized")
+    if not body.image_url.startswith("https://"):
+        raise HTTPException(400, "image_url must be https")
+    work = tempfile.mkdtemp(prefix="cut_")
+    try:
+        src = os.path.join(work, "in")
+        _download(body.image_url, src)
+        out = _cutout_rgba(src)
+        buf = os.path.join(work, "out.png")
+        out.save(buf)
+        return Response(content=open(buf, "rb").read(), media_type="image/png")
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"cutout failed: {e}")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+# ---------- animate (synthesize a clean motion loop from the cutout) ----------
+
+def _fit_contain(prod: Image.Image, cw: int, ch: int, frac: float) -> Image.Image:
+    w, h = prod.size
+    scale = min(cw * frac / w, ch * frac / h)
+    return prod.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
+
+
+def _animate_bytes(src_path: str, motion: str, dur: float, out_w: int, out_h: int) -> tuple[bytes, int]:
+    prod0 = Image.open(src_path).convert("RGBA")
+    # cap output long side for encode speed
+    lo = max(out_w, out_h)
+    if lo > ANIM_LONG:
+        s = ANIM_LONG / lo
+        out_w, out_h = max(2, round(out_w * s)), max(2, round(out_h * s))
+    out_w -= out_w % 2; out_h -= out_h % 2
+    fps = 24
+    n = max(24, int(dur * fps))
+    base = _fit_contain(prod0, out_w, out_h, 0.80)
+    work = tempfile.mkdtemp(prefix="anim_")
+    try:
+        cdir = os.path.join(work, "c"); os.makedirs(cdir)
+        for i in range(n):
+            p = 2 * math.pi * i / n  # 0..2π => seamless loop
+            canvas = Image.new("RGBA", (out_w, out_h), (0, 0, 0, 0))
+            if motion == "spin":
+                # fake-3D horizontal turn: squash width by cos(p); mirror on the back half.
+                cw = max(1, abs(math.cos(p)))
+                fr = base.transpose(Image.FLIP_LEFT_RIGHT) if math.cos(p) < 0 else base
+                fw = max(2, round(base.width * cw))
+                fr = fr.resize((fw, base.height), Image.LANCZOS)
+                dy = 0.0
+                ang = 0.0
+            else:  # "float": gentle levitation + sway
+                fr = base.rotate(3.0 * math.sin(p), resample=Image.BICUBIC, expand=True)
+                dy = 0.035 * out_h * math.sin(p)
+                ang = 0.0  # already applied
+            x = (out_w - fr.width) // 2
+            y = int((out_h - fr.height) // 2 + (dy if motion != "spin" else 0.028 * out_h * math.sin(p)))
+            canvas.alpha_composite(fr, (x, y))
+            canvas.save(os.path.join(cdir, f"{i + 1:04d}.png"))
+        out = os.path.join(work, "out.webm")
+        _encode_webm_alpha(cdir, str(fps), out)
+        return open(out, "rb").read(), n
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@app.post("/animate")
+def animate(body: AnimateIn, authorization: str | None = Header(default=None)):
+    if WORKER_TOKEN and authorization != f"Bearer {WORKER_TOKEN}":
+        raise HTTPException(401, "unauthorized")
+    if not body.image_url.startswith("https://"):
+        raise HTTPException(400, "image_url must be https")
+    work = tempfile.mkdtemp(prefix="animin_")
+    try:
+        src = os.path.join(work, "in.png")
+        _download(body.image_url, src)
+        data, nframes = _animate_bytes(
+            src, (body.motion or "float"), float(body.duration or 4.0),
+            int(body.out_w or 1080), int(body.out_h or 1080))
+        return Response(content=data, media_type="video/webm", headers={"X-Frames": str(nframes)})
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"animate failed: {e}")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+# ---------- per-frame transparency (mp4 -> WebM alpha), for /render and /produce ----------
 
 def _mp4_to_webm_alpha(src_mp4_path: str, work: str) -> tuple[bytes, int, str]:
-    """mp4 file -> (webm-alpha bytes, frame_count, fps). Raises on failure."""
     fdir, cdir = os.path.join(work, "f"), os.path.join(work, "c")
     os.makedirs(fdir, exist_ok=True); os.makedirs(cdir, exist_ok=True)
-
     _run(["ffmpeg", "-y", "-loglevel", "error", "-i", src_mp4_path, os.path.join(fdir, "%04d.png")])
     fps = subprocess.check_output(
         ["ffprobe", "-v", "0", "-of", "csv=p=0", "-select_streams", "v:0",
          "-show_entries", "stream=r_frame_rate", src_mp4_path]).decode().strip() or "24/1"
-
     frames = sorted(glob.glob(os.path.join(fdir, "*.png")))
     if not frames:
         raise RuntimeError("no frames extracted")
     if len(frames) > MAX_FRAMES:
         raise RuntimeError(f"too many frames ({len(frames)} > {MAX_FRAMES})")
-
     for i, f in enumerate(frames):
-        out = remove(Image.open(f).convert("RGBA"), session=_session, post_process_mask=True)
+        out = remove(Image.open(f).convert("RGBA"), session=_vid_session, post_process_mask=True)
         out.save(os.path.join(cdir, f"{i + 1:04d}.png"))
-
-    webm = os.path.join(work, "out.webm")
-    _run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", fps,
-          "-i", os.path.join(cdir, "%04d.png"),
-          "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-b:v", "0", "-crf", CRF,
-          "-an", webm])
-    return open(webm, "rb").read(), len(frames), fps
+    out = os.path.join(work, "out.webm")
+    _encode_webm_alpha(cdir, fps, out)
+    return open(out, "rb").read(), len(frames), fps
 
 
 @app.post("/render")
@@ -138,28 +248,7 @@ def render(body: RenderIn, authorization: str | None = Header(default=None)):
         shutil.rmtree(work, ignore_errors=True)
 
 
-@app.post("/cutout")
-def cutout(body: CutoutIn, authorization: str | None = Header(default=None)):
-    """Still product photo -> transparent PNG (rembg). Canonical product cutout (OBRAZ A)."""
-    if WORKER_TOKEN and authorization != f"Bearer {WORKER_TOKEN}":
-        raise HTTPException(401, "unauthorized")
-    if not body.image_url.startswith("https://"):
-        raise HTTPException(400, "image_url must be https")
-    work = tempfile.mkdtemp(prefix="cut_")
-    try:
-        src = os.path.join(work, "in")
-        _download(body.image_url, src)
-        out = remove(Image.open(src).convert("RGBA"), session=_session, post_process_mask=True)
-        buf = os.path.join(work, "out.png")
-        out.save(buf)
-        return Response(content=open(buf, "rb").read(), media_type="image/png")
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(500, f"cutout failed: {e}")
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
-
-
-# ---------- Higgsfield platform REST (Key auth) ----------
+# ---------- Higgsfield platform REST /produce (kept, unused by store pipeline) ----------
 
 def _hf_get(base: str, auth: str, path: str) -> dict:
     req = urllib.request.Request(base.rstrip("/") + path, method="GET",
@@ -169,7 +258,6 @@ def _hf_get(base: str, auth: str, path: str) -> dict:
 
 
 def _extract_video_url(results: dict | None) -> str | None:
-    """job.results -> best mp4 URL. Prefer full 'raw', fall back to 'min', else any nested url."""
     if not isinstance(results, dict):
         return None
     for k in ("raw", "min", "output", "video"):
@@ -178,7 +266,6 @@ def _extract_video_url(results: dict | None) -> str | None:
             return v["url"]
     if isinstance(results.get("url"), str):
         return results["url"]
-    # last resort: first nested {url:...} we can find
     for v in results.values():
         if isinstance(v, dict) and isinstance(v.get("url"), str):
             return v["url"]
@@ -186,7 +273,6 @@ def _extract_video_url(results: dict | None) -> str | None:
 
 
 def _poll_higgsfield_mp4(base: str, auth: str, job_set_id: str) -> str:
-    """Poll GET /v1/job-sets/{id} until a job completes; return its mp4 URL. Raises on fail/timeout."""
     deadline = time.time() + POLL_TIMEOUT
     while time.time() < deadline:
         js = _hf_get(base, auth, f"/v1/job-sets/{job_set_id}")
@@ -222,31 +308,23 @@ def _put_bytes(url: str, data: bytes, content_type: str):
 
 
 def _produce_job(body: ProduceIn):
-    """Background: Higgsfield poll -> transparent WebM -> Supabase upload -> callback."""
     cb = body.callback
     base = body.hf_base or HF_BASE_DEFAULT
     work = tempfile.mkdtemp(prefix="tp_")
     try:
         mp4_url = _poll_higgsfield_mp4(base, body.hf_auth, body.job_set_id)
-        print(f"[produce] {body.job_set_id} mp4 ready: {mp4_url[:80]}", flush=True)
         src = os.path.join(work, "in.mp4")
         _download(mp4_url, src)
         data, nframes, fps = _mp4_to_webm_alpha(src, work)
-        print(f"[produce] {body.job_set_id} webm ready: {len(data)}B {nframes}f {fps}", flush=True)
         _put_bytes(body.upload.url, data, "video/webm")
-        st, txt = _post_json(cb.url, {
-            "asset_id": cb.asset_id, "token": cb.token, "status": "done",
-            "storage_path": body.upload.storage_path, "frames": nframes, "fps": fps,
-            "bytes": len(data)})
-        print(f"[produce] {body.job_set_id} callback done -> {st} {txt}", flush=True)
-    except Exception as e:  # noqa: BLE001 — report every failure to the callback
-        msg = str(e)[:400]
-        print(f"[produce] {body.job_set_id} ERROR: {msg}", flush=True)
+        _post_json(cb.url, {"asset_id": cb.asset_id, "token": cb.token, "status": "done",
+                            "storage_path": body.upload.storage_path, "frames": nframes, "fps": fps})
+    except Exception as e:  # noqa: BLE001
         try:
             _post_json(cb.url, {"asset_id": cb.asset_id, "token": cb.token,
-                                "status": "error", "error": msg})
-        except Exception as e2:  # noqa: BLE001
-            print(f"[produce] {body.job_set_id} callback failed: {e2}", flush=True)
+                                "status": "error", "error": str(e)[:400]})
+        except Exception:  # noqa: BLE001
+            pass
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

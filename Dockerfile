@@ -10,9 +10,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download the rembg model into the image so the pod starts ready (no cold fetch).
+# Pre-download the rembg models into the image so the pod starts ready (no cold fetch).
+# u2netp = fast per-frame video; u2net = higher-quality still cutout (isolated product).
 ENV REMBG_MODEL=u2netp
-RUN python -c "from rembg import new_session; new_session('u2netp')"
+ENV CUTOUT_MODEL=u2net
+RUN python -c "from rembg import new_session; new_session('u2netp'); new_session('u2net')"
 
 COPY app.py .
 EXPOSE 8080
