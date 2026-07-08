@@ -25,6 +25,8 @@ Endpoints:
 Real browser transparency needs WebM VP9 alpha (yuva420p); rembg yields the true alpha.
 """
 import math, os, glob, json, shutil, subprocess, tempfile, threading, time, urllib.request, urllib.error
+import numpy as np
+from scipy import ndimage
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -224,11 +226,32 @@ def _mp4_to_webm_alpha(src_mp4_path: str, work: str) -> tuple[bytes, int, str]:
     if len(frames) > MAX_FRAMES:
         raise RuntimeError(f"too many frames ({len(frames)} > {MAX_FRAMES})")
     for i, f in enumerate(frames):
-        out = remove(Image.open(f).convert("RGBA"), session=_vid_session, post_process_mask=True)
-        out.save(os.path.join(cdir, f"{i + 1:04d}.png"))
+        rgba = remove(Image.open(f).convert("RGBA"), session=_vid_session, post_process_mask=True)
+        _solidify_alpha(rgba).save(os.path.join(cdir, f"{i + 1:04d}.png"))
     out = os.path.join(work, "out.webm")
     _encode_webm_alpha(cdir, fps, out)
     return open(out, "rb").read(), len(frames), fps
+
+
+def _solidify_alpha(rgba: Image.Image) -> Image.Image:
+    """Fill enclosed holes in the alpha (transparent product parts like a clear bottle seen over the
+    generated dark bg get keyed out by rembg -> a see-through hole). Flood-fill from the frame border
+    marks the true background; any transparent region NOT reachable from the border is interior product
+    -> force it opaque. Also drop stray specks by keeping the largest component. Opaque products have no
+    enclosed holes, so this is a no-op for them."""
+    arr = np.array(rgba)  # H x W x 4
+    a = arr[:, :, 3]
+    fg = a > 30
+    filled = ndimage.binary_fill_holes(fg)
+    lbl, n = ndimage.label(filled)
+    if n > 1:
+        sizes = ndimage.sum(np.ones_like(lbl), lbl, index=range(1, n + 1))
+        filled = lbl == (int(np.argmax(sizes)) + 1)
+    holes = filled & (a <= 30)          # interior pixels that were transparent
+    if holes.any():
+        arr[:, :, 3][holes] = 255       # make the product solid (no see-through hole)
+    arr[:, :, 3][~filled] = 0           # background stays fully transparent
+    return Image.fromarray(arr, "RGBA")
 
 
 @app.post("/render")
